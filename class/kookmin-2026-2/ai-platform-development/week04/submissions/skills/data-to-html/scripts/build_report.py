@@ -1,0 +1,402 @@
+# -*- coding: utf-8 -*-
+"""data-to-html: documents(MD) + data(CSV) -> HTML 리포트 한 파일.
+
+문서별 요약은 원문 근거를 핵심 문장 + 불릿 3개로 정리한다(원문 자르기 금지).
+CSV 핵심 표는 참가신청 상태별 인원, 재원별 잔액·E04 순지출,
+정원 시나리오별(140/160/180) 구매 예정액과 현금대비를 담는다.
+원본 문서 규칙(RULE-01, RULE-02, CLUB-01, ACCOUNT-01 등)에 따라 집계한다.
+CSV는 UTF-8로 직접 읽고, HTML도 UTF-8로 직접 저장한다(한글 모지케 방지).
+원본 CSV는 수정하지 않는다.
+"""
+import argparse
+import csv
+import html
+import os
+from collections import Counter
+from datetime import datetime
+
+# 문서별 큐레이션 요약 (원문 근거로 정리 — 원문 자르기 대신 간결 요약 + 불릿 3개)
+DOC_SUMMARY = {
+    "W04_01_학교지원금지침.md": (
+        "RULE-01",
+        "승인 행사에 승인서 사업·한도 내에서 집행한다. 인화 재료·설치·홍보는 지원 대상, 식음료는 확정 참가자용 1인 4,000원 이내(정산 시 실제 참석 대조). 기념품·개인 선물·주류는 지원 제외. 승인됐으나 미입금 금액은 현재 현금에 더하지 않는다.",
+        ["식음료 1인 4,000원 이내, 최종 정산은 실제 참석 대조",
+         "기념품·개인 선물·주류는 학교 지원금 제외",
+         "미입금 승인액은 현금에 미가산(제5조)"],
+    ),
+    "W04_02_학교공간이용안내.md": (
+        "RULE-02",
+        "참가 정원은 발급된 장소 사용 승인서에 따르며, 회의 결정·홍보 문구만으로 바꿀 수 없다. 대상 행사·적용일이 명시된 변경 승인서가 있어야 변경된다.",
+        ["정원 = 장소 사용 승인서 기준(운영요원 제외)",
+         "홍보·회의만으로 정원 변경 불가",
+         "유효한 변경 승인서만 정원 변경 효력"],
+    ),
+    "W04_03_동아리운영규칙.md": (
+        "CLUB-01",
+        "신청 상태는 확정·대기·취소. 물품 구매 기본 인원은 확정 인원이며, 대기자 전환은 승인 후 명단 반영한다. 회비 기념품은 1인 3,000원 이내·결재·영수증 필요. 원본 CSV 보존, 판단 근거는 문서 ID·조항으로 남긴다.",
+        ["구매 기본 인원 = 확정 인원",
+         "대기자는 전환 승인 전 확정에 미리 더하지 않음",
+         "회비 기념품 1인 3,000원 이내"],
+    ),
+    "W04_04_행사안내.md": (
+        "NOTICE-04",
+        "빛담 가을사진전과 인화 체험, 2026-09-28 14:00~17:00 학생회관 전시실. 홍보상 모집 정원 180명이라 적혀 있으나 이 안내는 홍보용이며 장소 승인서가 아니다. 운영 검토 기준일 2026-09-22.",
+        ["행사일 2026-09-28, 학생회관 전시실",
+         "홍보 정원 180명은 승인 정원이 아님",
+         "홍보용 안내(승인서 아님)"],
+    ),
+    "W04_05_지원금승인서.md": (
+        "APPROVAL-FUND-04",
+        "E04 총 승인 한도 1,500,000원. 1차 지급 1,000,000원(입금은 회계 T091로 확인). 잔여 500,000원은 정산서 승인 후 지급 예정이라 현재 가용 현금으로 계산하지 않는다. RULE-01 준수, 기념품·개인 선물 제외.",
+        ["총 승인 한도 1,500,000원 / 1차 지급 1,000,000원",
+         "잔여 500,000원은 미입금 → 현금 미포함",
+         "발급일 2026-09-12"],
+    ),
+    "W04_06_장소사용승인서.md": (
+        "APPROVAL-SPACE-04",
+        "발급일 2026-09-14. 승인 참가 정원 160명(운영요원 별도). 180명 홍보물은 승인 조건과 달라 정정 검토 필요이며, 유효한 변경 승인서 발급 전까지 정원은 160명이다.",
+        ["승인 참가 정원 160명(운영요원 별도)",
+         "180명 홍보물은 정정 검토 대상",
+         "변경 승인서 전까지 정원 160명 확정"],
+    ),
+    "W04_07_운영회의메모.md": (
+        "MEMO-04",
+        "작성일 2026-09-18. 홍보 180명 vs 현재 승인 160명 불일치를 인지하고 180명 변경을 요청 예정이나, 변경 승인 기록은 아직 없다. 기념품은 회비 처리 논의, 용도 미기재 인화비는 재확인, 외부인 참가 조건은 이 회의에서 결정하지 않았다.",
+        ["180명 변경은 요청 예정, 승인 기록 없음",
+         "외부인 참가 조건 미결정",
+         "용도 미기재 인화비는 증빙·목적 재확인"],
+    ),
+    "W04_08_회계기준.md": (
+        "ACCOUNT-01",
+        "회계 CSV는 2026-07-01~09-22 처리 완료 120건, 기초 잔액 학교지원금 0·회비 800,000. 현재 잔액=기초+수입+환불입금-지출-환불지급. E04 순지출=지출+환불지급-환불입금(수입 제외). 구매계획 CSV는 예정 수량이며 회계 거래에 합산하지 않는다.",
+        ["기초 잔액: 학교지원금 0 / 회비 800,000",
+         "E04 순지출은 수입 제외로 계산",
+         "구매계획은 예정 비용(회계 미합산)"],
+    ),
+    "W04_09_정원변경승인서.md": (
+        "CHANGE-SPACE-04",
+        "발급일 2026-09-23. 2026-09-28 행사에 한해 승인 참가 정원을 160명에서 180명으로 변경한다(운영요원 별도). APPROVAL-SPACE-04의 정원 조항을 대체하되 나머지 조건은 유지. 예산 증액을 승인하지 않으며 신청자 상태를 자동 변경하지 않는다.",
+        ["승인 정원 160 → 180명으로 변경(대체 효력)",
+         "예산 증액 승인 아님",
+         "신청자 상태 자동 변경 아님"],
+    ),
+}
+
+
+def read_csv(path):
+    with open(path, encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
+def esc(x):
+    return html.escape(str(x))
+
+
+def build(docs_dir, data_dir, out_path):
+    # ---- documents ----
+    doc_files = sorted(f for f in os.listdir(docs_dir) if f.lower().endswith(".md"))
+
+    # ---- 참가신청 ----
+    P = read_csv(os.path.join(data_dir, "참가신청.csv"))
+    e04 = [r for r in P if r["행사_ID"] == "E04"]
+    st = Counter(r["신청상태"] for r in e04)
+    conf = [r for r in e04 if r["신청상태"] == "확정"]
+    n_conf = len(conf)
+    hwa = sum(1 for r in conf if r["인화체험"] == "신청")
+    food = sum(1 for r in conf if r["식음료"] == "신청")
+
+    # ---- 회계 ----
+    A = read_csv(os.path.join(data_dir, "회계내역.csv"))
+    base_bal = {"학교지원금": 0, "동아리회비": 800000}
+    funds = sorted(set(r["재원"] for r in A))
+    bal = {k: base_bal.get(k, 0) for k in funds}
+    for r in A:
+        amt = int(r["금액"])
+        if r["유형"] in ("수입", "환불입금"):
+            bal[r["재원"]] += amt
+        elif r["유형"] in ("지출", "환불지급"):
+            bal[r["재원"]] -= amt
+    e04a = [r for r in A if r["행사_ID"] == "E04"]
+    net = {}
+    for r in e04a:
+        amt = int(r["금액"])
+        net.setdefault(r["재원"], 0)
+        if r["유형"] == "지출":
+            net[r["재원"]] += amt
+        elif r["유형"] == "환불지급":
+            net[r["재원"]] += amt
+        elif r["유형"] == "환불입금":
+            net[r["재원"]] -= amt
+
+    # ---- 구매계획: 정원 시나리오별 ----
+    Q = read_csv(os.path.join(data_dir, "구매계획.csv"))
+
+    def plan_for(n):
+        pf = {}
+        for r in Q:
+            qty = n * int(r["계수"]) if r["수량기준"] == "참가자" else int(r["계수"])
+            pf[r["예정재원"]] = pf.get(r["예정재원"], 0) + qty * int(r["단가"])
+        return pf
+
+    # ---- 회계 유형별 합계 / 행사×재원 순액 ----
+    type_tot = {}
+    for r in A:
+        t = r["유형"]
+        cur = type_tot.setdefault(t, [0, 0])
+        cur[0] += int(r["금액"])
+        cur[1] += 1
+    ev_net = {}
+    for r in A:
+        amt = int(r["금액"])
+        s = amt if r["유형"] in ("수입", "환불입금") else -amt
+        ev_net[(r["행사_ID"], r["재원"])] = ev_net.get((r["행사_ID"], r["재원"]), 0) + s
+
+    scenarios = [(f"{n_conf}명(확정)", n_conf), ("160명(이전 승인)", 160), ("180명(현 승인)", 180)]
+
+    def money(v):
+        return f"{v:,}"
+
+    def won(v):
+        return f"{v:,}원"
+
+    # ---- 문서 요약 카드 그리드 ----
+    doc_cards = ""
+    for f in doc_files:
+        doc_id, summary, bullets = DOC_SUMMARY.get(f, ("", "", []))
+        lis = "".join(f"<li>{esc(b)}</li>" for b in bullets)
+        doc_cards += (
+            "<article class='card'>"
+            f"<span class='tag'>{esc(doc_id)}</span>"
+            f"<h3>{esc(f)}</h3>"
+            f"<p>{esc(summary)}</p>"
+            f"<ul>{lis}</ul></article>"
+        )
+
+    # ---- 시나리오 행 ----
+    scen_rows = ""
+    for label, n in scenarios:
+        pf = plan_for(n)
+        sch, club = pf.get("학교지원금", 0), pf.get("동아리회비", 0)
+        sch_cash, club_cash = bal["학교지원금"] - sch, bal["동아리회비"] - club
+        sc = "neg" if sch_cash < 0 else "pos"
+        cc = "neg" if club_cash < 0 else "pos"
+        scen_rows += (
+            f"<tr><td>{esc(label)}</td>"
+            f"<td>{money(sch)}</td><td class='{sc}'>{money(sch_cash)}</td>"
+            f"<td>{money(club)}</td><td class='{cc}'>{money(club_cash)}</td></tr>"
+        )
+
+    # ---- 구매계획 12항목 상세 행 ----
+    plan_item_rows = ""
+    for r in Q:
+        base = "참가자" if r["수량기준"] == "참가자" else "고정"
+        qty_disp = f"{n_conf}×{r['계수']}={n_conf * int(r['계수'])}" if base == "참가자" else r["계수"]
+        cost = (n_conf * int(r["계수"]) if base == "참가자" else int(r["계수"])) * int(r["단가"])
+        plan_item_rows += (
+            f"<tr><td>{esc(r['항목_ID'])}</td><td>{esc(r['물품'])}</td><td>{esc(base)}</td>"
+            f"<td>{esc(qty_disp)}</td><td>{money(int(r['단가']))}</td><td>{money(cost)}</td>"
+            f"<td>{esc(r['예정재원'])}</td><td>{esc(r['용도'])}</td></tr>"
+        )
+
+    # ---- 회계 유형별 / 행사×재원 행 ----
+    type_rows = "".join(
+        f"<tr><td>{esc(t)}</td><td>{money(v[0])}</td><td>{v[1]}</td></tr>"
+        for t, v in sorted(type_tot.items())
+    )
+    ev_rows = "".join(
+        f"<tr><td>{esc(k[0])}</td><td>{esc(k[1])}</td><td>{money(v)}</td></tr>"
+        for k, v in sorted(ev_net.items())
+    )
+
+    # ---- 결론 요약 박스 값 ----
+    sch_bal = bal["학교지원금"]
+    concl = [
+        ("최대 <b>180명</b>까지", "정원 변경 승인서(CHANGE-SPACE-04, 2026-09-23)로 160→180 변경. APPROVAL-SPACE-04 정원 조항을 대체(RULE-02)."),
+        ("학교지원금 현금 <b>부족</b>", f"현재 잔액 {won(sch_bal)}인데 180명 예정액 {won(plan_for(180).get('학교지원금', 0))} → −62,000원(미입금 잔여 50만원 제외)."),
+        ("대기자 전환·외부 참가는 <b>확인 필요</b>", "대기자 전환은 재원 확인+담당 승인 후 순서대로(CLUB-01). 외부 대학 학생 참가 근거는 없음(MEMO-04 미결정)."),
+    ]
+    concl_html = "".join(
+        f"<li><span class='cnum'>{i+1}</span><div><p class='ctitle'>{t}</p><p class='cdesc'>{esc(d)}</p></div></li>"
+        for i, (t, d) in enumerate(concl)
+    )
+
+    html_out = f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>빛담 가을사진전(E04) 운영 근거 리포트</title>
+<style>
+:root{{--ink:#20303f;--muted:#6b7d8f;--line:#e3e9ef;--accent:#0f766e;--accent2:#f0fdfa;--warn:#c2410c;--pos:#15803d;--bg:#f6f8fa;}}
+*{{box-sizing:border-box;}}
+body{{margin:0;background:var(--bg);color:var(--ink);font-family:'Pretendard','Malgun Gothic','Apple SD Gothic Neo',sans-serif;line-height:1.65;}}
+.wrap{{max-width:940px;margin:0 auto;padding:40px 22px 72px;}}
+header h1{{font-size:26px;margin:0 0 4px;letter-spacing:-.3px;}}
+header .sub{{color:var(--muted);font-size:13px;margin:0;}}
+.concl{{margin:26px 0 8px;background:linear-gradient(135deg,var(--accent) 0%,#115e59 100%);color:#fff;border-radius:16px;padding:22px 26px;box-shadow:0 10px 24px rgba(15,118,110,.22);}}
+.concl h2{{margin:0 0 14px;font-size:15px;letter-spacing:2px;text-transform:uppercase;opacity:.85;}}
+.concl ul{{list-style:none;margin:0;padding:0;display:grid;gap:14px;}}
+.concl li{{display:flex;gap:14px;align-items:flex-start;}}
+.cnum{{flex:none;width:26px;height:26px;border-radius:50%;background:rgba(255,255,255,.18);display:grid;place-items:center;font-weight:700;font-size:14px;}}
+.ctitle{{margin:0;font-size:16px;}}
+.cdesc{{margin:2px 0 0;font-size:13px;opacity:.9;}}
+h2.sec{{margin:40px 0 4px;font-size:19px;}}
+h2.sec::before{{content:'';display:inline-block;width:10px;height:10px;border-radius:3px;background:var(--accent);margin-right:9px;vertical-align:middle;}}
+.seclead{{color:var(--muted);font-size:13px;margin:0 0 16px;}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:14px;}}
+.card{{background:#fff;border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:12px;padding:15px 17px;}}
+.card .tag{{display:inline-block;background:var(--accent2);color:var(--accent);font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px;letter-spacing:.5px;}}
+.card h3{{margin:8px 0 6px;font-size:13.5px;color:var(--muted);font-weight:600;}}
+.card p{{margin:0 0 8px;font-size:13px;}}
+.card ul{{margin:0;padding-left:18px;font-size:12.5px;color:#41505f;}}
+.card li{{margin-bottom:3px;}}
+table{{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden;font-size:14px;margin-top:6px;}}
+caption{{text-align:left;font-weight:700;font-size:14px;margin-bottom:8px;color:var(--ink);}}
+th,td{{padding:9px 12px;border-bottom:1px solid var(--line);text-align:left;}}
+th{{background:#eef4f3;color:#134e4a;font-size:13px;}}
+td.pos{{color:var(--pos);font-weight:600;}}
+td.neg{{color:var(--warn);font-weight:600;}}
+.srcline{{color:#9aa8b5;font-size:12px;margin:0 0 4px;}}
+.note{{background:#fff8f1;border:1px solid #fcd9b8;color:#7c3a12;border-radius:10px;padding:11px 15px;font-size:13px;margin-top:10px;}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>빛담 가을사진전(E04) 운영 근거 리포트</h1>
+<p class="sub">생성일 {datetime.now():%Y-%m-%d} · 근거 documents {len(doc_files)}건 + data 3건 · 검토 기준일 2026-09-22 · <code>data-to-html</code></p>
+</header>
+
+<section class="concl">
+<h2>한눈에 보는 결론</h2>
+<ul>{concl_html}</ul>
+</section>
+
+<h2 class="sec">변경 전후 판단</h2>
+<p class="seclead">정원 변경 승인서(CHANGE-SPACE-04, 2026-09-23) 발급 전후로 달라진 판단과, 승인서가 바꾸지 않은 것을 구분합니다.</p>
+<table>
+<caption>초기(~09-22) vs 최종(09-23 이후)</caption>
+<tr><th>구분</th><th>초기</th><th>최종</th></tr>
+<tr><td>유효 정원(운영요원 제외)</td><td>160명</td><td><b>180명</b></td></tr>
+<tr><td>정원 근거</td><td>APPROVAL-SPACE-04</td><td>CHANGE-SPACE-04 (대체)</td></tr>
+<tr><td>180명 성격</td><td>홍보 문구·미승인(NOTICE-04)</td><td>정식 변경 승인 완료</td></tr>
+<tr><td>판단 상태</td><td>"180명 확인 필요"</td><td>"180명 확정"</td></tr>
+</table>
+<div class="note">초기에는 변경 승인 기록이 없어(MEMO-04) RULE-02 제2조에 따라 홍보 180명을 인정하지 않고 160명으로 판단했다. 09-23 CHANGE-SPACE-04 발급으로 요건이 충족되어 180명으로 상향됐다.</div>
+<article class="card" style="margin-top:14px;border-left-color:#c2410c">
+<span class="tag" style="background:#fff1e8;color:#c2410c">승인서가 바꾸지 않은 것</span>
+<ul style="margin:10px 0 0;padding-left:18px;font-size:13px;color:#41505f">
+<li><b>예산 불변</b> — CHANGE-SPACE-04는 예산 증액 승인이 아니다. 지원금 한도 1,500,000원, 1차 지급 1,000,000원(T091), 잔여 500,000원은 미입금이라 현금 미가산(RULE-01 제5조).</li>
+<li><b>확정 인원 불변</b> — 정원 상향과 무관하게 확정은 여전히 140명. 신청자 상태는 승인서·AI 보고서로 자동 변경되지 않는다(RULE-02 제3조, CLUB-01 제3조).</li>
+<li><b>재원 잔액 불변</b> — 학교지원금 250,000원 / 동아리회비 1,843,000원. E04 순지출 학교지원금 750,000원 / 회비 146,000원.</li>
+<li><b>지원 제외 규정 불변</b> — 기념품·개인 선물은 학교지원금 대상 아님(RULE-01 제3조), 회비로 처리(CLUB-01 제2조).</li>
+</ul>
+</article>
+
+<h2 class="sec">문서 요약</h2>
+<p class="seclead">규정·승인서·메모 {len(doc_files)}건에서 운영 판단에 필요한 조건만 추렸습니다.</p>
+<div class="grid">{doc_cards}</div>
+
+<h2 class="sec">핵심 표</h2>
+<p class="seclead">참가 인원, 재원별 현황, 정원 시나리오별 예산 여력을 원본 CSV에서 집계했습니다.</p>
+
+<p class="srcline">출처: 참가신청.csv (E04 {len(e04)}건)</p>
+<table>
+<caption>① 신청 상태별 인원과 확정자 선택</caption>
+<tr><th>항목</th><th>값</th></tr>
+<tr><td>확정</td><td>{st.get('확정', 0)}</td></tr>
+<tr><td>대기</td><td>{st.get('대기', 0)}</td></tr>
+<tr><td>취소</td><td>{st.get('취소', 0)}</td></tr>
+<tr><td>확정자 중 인화체험 신청</td><td>{hwa}</td></tr>
+<tr><td>확정자 중 식음료 신청</td><td>{food}</td></tr>
+</table>
+<div class="note">구매 기본 인원은 확정 {n_conf}명(CLUB-01 제1조). 대기 {st.get('대기', 0)}명은 전환 승인 전까지 미포함.</div>
+
+<p class="srcline" style="margin-top:22px">출처: 회계내역.csv ({len(A)}건, ACCOUNT-01)</p>
+<table>
+<caption>② 현재 재원별 잔액과 E04 순지출</caption>
+<tr><th>재원</th><th>현재 잔액</th><th>E04 순지출</th></tr>
+<tr><td>학교지원금</td><td>{won(bal['학교지원금'])}</td><td>{won(net.get('학교지원금', 0))}</td></tr>
+<tr><td>동아리회비</td><td>{won(bal['동아리회비'])}</td><td>{won(net.get('동아리회비', 0))}</td></tr>
+</table>
+<div class="note">미입금 승인 잔여 500,000원은 현금 미포함(RULE-01 제5조, APPROVAL-FUND-04). E04 순지출은 수입 제외.</div>
+
+<p class="srcline" style="margin-top:22px">출처: 구매계획.csv (12항목) + 회계 잔액</p>
+<table>
+<caption>③ 정원 시나리오별 구매 예정액과 현금 대비(잔액−예정액)</caption>
+<tr><th>정원</th><th>학교지원금 예정</th><th>학교지원금 현금대비</th><th>동아리회비 예정</th><th>동아리회비 현금대비</th></tr>
+{scen_rows}
+</table>
+<div class="note">세 시나리오 모두 학교지원금 현금이 부족(−6,000 / −34,000 / −62,000). 동아리회비는 충분. 현재 유효 정원은 변경 승인서 CHANGE-SPACE-04 기준 <b>180명</b>(이전 160명 조항 대체). 단 변경 승인서는 예산 증액을 승인하지 않으므로 학교지원금 부족은 정산·잔여 지급 확인으로 별도 해소해야 함.</div>
+
+<p class="srcline" style="margin-top:22px">출처: 구매계획.csv (12항목) — 확정 {n_conf}명 기준</p>
+<table>
+<caption>④ 구매계획 12개 항목 상세 (예정 · 회계 미합산)</caption>
+<tr><th>항목_ID</th><th>물품</th><th>수량기준</th><th>수량</th><th>단가</th><th>예정비용</th><th>예정재원</th><th>용도</th></tr>
+{plan_item_rows}
+</table>
+<div class="note">'참가자' = 확정 인원 × 계수, '고정' = 계수. 예정비용 = 단가 × 수량. 구매계획은 앞으로 필요한 수량 계산이며 회계 거래·기지급 비용에 합산하지 않는다(ACCOUNT-01 제4·5조).</div>
+
+<p class="srcline" style="margin-top:22px">출처: 회계내역.csv (120건) — 유형별 원금액</p>
+<table>
+<caption>⑤ 회계 유형별 합계 (부호 없는 원금액)</caption>
+<tr><th>유형</th><th>금액 합</th><th>건수</th></tr>
+{type_rows}
+</table>
+<div class="note">부호 규칙: 수입·환불입금 +, 지출·환불지급 −(ACCOUNT-01 제2조). 위 표는 부호를 적용하기 전의 원금액 합계다.</div>
+
+<p class="srcline" style="margin-top:22px">출처: 회계내역.csv — 행사 × 재원 순액(부호 적용)</p>
+<table>
+<caption>⑥ 행사 × 재원 순액</caption>
+<tr><th>행사_ID</th><th>재원</th><th>순액</th></tr>
+{ev_rows}
+</table>
+<div class="note">순액 = 수입 + 환불입금 − 지출 − 환불지급. E04 동아리회비 순액에는 수입이 포함되므로, 순지출(수입 제외) 146,000원과는 다르다.</div>
+
+<h2 class="sec">재검색 질문 세 가지</h2>
+<p class="seclead">변경 승인서 반영 후 지식 재검색·재집계 결과입니다. 상세 근거는 submissions/재검색_질문답변.md.</p>
+<div class="card wide" style="margin-bottom:14px">
+<h3 style="margin:0 0 6px;font-size:15px">Q1. 행사에 최대 몇 명까지 받을 수 있나요?</h3>
+<p style="margin:0 0 6px;font-size:13.5px"><b>답: 최대 180명</b> (운영요원 별도).</p>
+<ul style="margin:0;padding-left:18px;font-size:13px;color:#41505f">
+<li>CHANGE-SPACE-04(09-23) "승인 참가 정원을 160명에서 180명으로 변경" — APPROVAL-SPACE-04 정원 조항 대체.</li>
+<li>RULE-02 제1조: 정원은 장소 승인서 기준, 운영요원 제외 신청 참가자 수. 제2조: 대상 행사·적용일 명시 변경 승인서만 정원을 바꿈 → 요건 충족.</li>
+<li>초기엔 변경 승인 기록 없어(MEMO-04) 홍보 180명을 인정하지 않고 160명 판단 → 승인 후 180명 상향.</li>
+</ul>
+</div>
+<div class="card wide" style="margin-bottom:14px">
+<h3 style="margin:0 0 6px;font-size:15px">Q2. 대기자를 모두 확정해 준비해도 될까요?</h3>
+<p style="margin:0 0 6px;font-size:13.5px"><b>답: 정원상 가능(확정140+대기40=180=정원)하나, 지금 바로 전원 확정은 불가 — 재원 확인·담당 승인 선행.</b></p>
+<ul style="margin:0;padding-left:18px;font-size:13px;color:#41505f">
+<li>CLUB-01 제3조·RULE-02 제3조: 대기자 전환은 승인 정원·준비 물품·가용 재원을 함께 확인한 뒤 신청 순서대로 담당자가 승인해 반영. AI 보고서만으로 상태 변경 불가.</li>
+<li>CLUB-01 제1조: 전환 전 확정 인원에 미리 더하지 않는다.</li>
+<li>예산: 180명 학교지원금 예정 312,000원 &gt; 잔액 250,000원 → 62,000원 부족. 잔여 지원금(정산 후 지급, 현금 미가산) 또는 회비 보전 필요.</li>
+</ul>
+</div>
+<div class="card wide">
+<h3 style="margin:0 0 6px;font-size:15px">Q3. 외부 대학 학생의 참가가 허용되나요?</h3>
+<p style="margin:0 0 6px;font-size:13.5px"><b>답: 확인 필요 — 자료로 결정되지 않음.</b></p>
+<ul style="margin:0;padding-left:18px;font-size:13px;color:#41505f">
+<li>MEMO-04 "외부인 참가 조건은 이 회의에서 결정하지 않았다." 다른 문서(RULE·CLUB·승인서·NOTICE)에도 외부 대학생 참가 허용/금지 조항 없음.</li>
+<li>RULE-01 제1조는 '빛담 동아리의 승인된 교내 행사', RULE-02 제1조는 '신청 참가자 수'로만 규정 — 소속(교내/외부) 자격 조건 미명시.</li>
+<li>확인 필요: 외부 참가 허용 여부·조건(별도 승인·신청 자격·안전/보험). 담당자·별도 지침 확인 전까지 미결.</li>
+</ul>
+</div>
+
+</div>
+</body>
+</html>"""
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html_out)
+    print("WROTE", out_path, "bytes=", len(html_out.encode("utf-8")))
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--docs", required=True)
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--out", required=True)
+    a = ap.parse_args()
+    build(a.docs, a.data, a.out)
