@@ -1,0 +1,11 @@
+{
+  "warehouse": "warehouse-c",
+  "total": 15,
+  "items": {
+    "nut": 1,
+    "washer": 8,
+    "gasket": 1,
+    "clip": 2,
+    "bracket": 3
+  }
+}
